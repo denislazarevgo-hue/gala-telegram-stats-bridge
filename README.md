@@ -1,14 +1,17 @@
-# Gala Telegram Stats Bridge
+# Gala Telegram + MAX Stats Bridge
 
-Небольшой сервис для точного сбора просмотров и реакций Telegram-постов через MTProto.
+Небольшой сервис для точного сбора просмотров и реакций Telegram-постов через MTProto и MAX-постов через официальный MAX Bot API.
 
 Он нужен, когда Telegram-ссылок много. TGStat Free быстро упирается в лимиты, а этот сервис получает статистику напрямую через Telegram-сессию и поддерживает пачечный endpoint `/stats/batch`.
+
+Для MAX мост нужен из-за HTTPS-особенностей домена `platform-api2.max.ru`: основной сайт может получить `HTTP 526`, а Cloud Run-сервис может ходить в MAX через управляемый HTTP-клиент.
 
 ## Что потребуется один раз
 
 1. `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` из my.telegram.org.
 2. `TELEGRAM_SESSION_STRING`, созданная локально через `make_session.py`.
 3. `TELEGRAM_BRIDGE_TOKEN`, любой длинный пароль для связи сайта с мостом.
+4. Для MAX отдельный секрет в мосте не нужен: сайт передаёт свой `MAX_BOT_TOKEN` в `Authorization`.
 
 ## Локальная проверка
 
@@ -27,6 +30,12 @@ uvicorn app:app --reload --port 8000
 curl "http://localhost:8000/health"
 ```
 
+Проверка MAX:
+
+```bash
+curl -H "Authorization: Bearer MAX_BOT_TOKEN" "http://localhost:8000/max/stats?url=https://max.ru/channel/message"
+```
+
 ## Подключение к сайту
 
 В переменные сайта нужно добавить:
@@ -35,9 +44,11 @@ curl "http://localhost:8000/health"
 TELEGRAM_STATS_BATCH_ENDPOINT=https://адрес-моста/stats/batch
 TELEGRAM_STATS_ENDPOINT=https://адрес-моста/stats
 TELEGRAM_STATS_TOKEN=тот_же_TELEGRAM_BRIDGE_TOKEN
+MAX_STATS_BATCH_ENDPOINT=https://адрес-моста/max/stats/batch
+MAX_STATS_ENDPOINT=https://адрес-моста/max/stats
 ```
 
-После этого кнопка обновления на сайте будет собирать Telegram по каналам пачками и возвращать точные целые значения.
+После этого кнопка обновления на сайте будет собирать Telegram и MAX пачками и возвращать точные целые значения, если платформа отдаёт статистику конкретного поста.
 
 ## Развёртывание
 

@@ -1,8 +1,8 @@
 .env
+telegram_session_string.txt
 *.session
 *.session-journal
 __pycache__/
 .pytest_cache/
 .venv/
 venv/
-

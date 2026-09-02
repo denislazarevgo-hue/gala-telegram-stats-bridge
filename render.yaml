@@ -18,3 +18,7 @@ services:
         value: 25
       - key: TELEGRAM_BATCH_CHUNK_SIZE
         value: 100
+      - key: MAX_BATCH_CHUNK_SIZE
+        value: 100
+      - key: MAX_VERIFY_TLS
+        value: false
