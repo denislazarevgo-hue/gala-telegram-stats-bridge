@@ -63,7 +63,7 @@ def _result(
 def _require_auth(request: Request) -> None:
     expected = os.getenv("TELEGRAM_BRIDGE_TOKEN", "").strip()
     if not expected:
-        return
+        raise HTTPException(status_code=503, detail="TELEGRAM_BRIDGE_TOKEN не заполнен.")
     header = request.headers.get("authorization", "")
     if header != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="Неверный Telegram bridge token.")
