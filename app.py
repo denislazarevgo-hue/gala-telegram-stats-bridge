@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as html_lib
+import json
 import os
 import re
 from collections import defaultdict
@@ -22,6 +24,9 @@ app = FastAPI(title="Gala Telegram Stats Bridge")
 
 _client: TelegramClient | None = None
 _client_lock = asyncio.Lock()
+_max_user_client: Any | None = None
+_max_user_client_lock = asyncio.Lock()
+_max_user_chat_ids: dict[str, str] = {}
 
 
 class StatsItem(BaseModel):
@@ -135,6 +140,7 @@ async def health() -> dict[str, Any]:
         "telegram_api_hash": bool(os.getenv("TELEGRAM_API_HASH", "").strip()),
         "telegram_session": bool(os.getenv("TELEGRAM_SESSION_STRING", "").strip()),
         "max_bridge": True,
+        "max_user_session": _max_user_session_configured(),
         "max_verify_tls": _max_verify_tls(),
     }
 
@@ -298,6 +304,19 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
         return {"items": invalid}
 
     output = invalid[:]
+
+    if _max_user_session_configured():
+        user_rows = await _collect_max_user_session_batch(candidates)
+        user_ok_keys = {
+            _max_item_key(MaxStatsItem(id=row.get("id"), url=str(row.get("url") or "")))
+            for row in user_rows
+            if row.get("status") == "ok"
+        }
+        output.extend(row for row in user_rows if row.get("status") == "ok")
+        candidates = [item for item in candidates if _max_item_key(item) not in user_ok_keys]
+        if not candidates:
+            return {"items": sorted(output, key=lambda row: row.get("id") or 0)}
+
     direct_candidates: list[MaxStatsItem] = []
     grouped: dict[str, list[MaxStatsItem]] = defaultdict(list)
     for item in candidates:
@@ -460,6 +479,401 @@ async def _collect_max_direct_batch(items: list[MaxStatsItem], token: str) -> li
     return output
 
 
+async def _collect_max_user_session_batch(items: list[MaxStatsItem]) -> list[dict[str, Any]]:
+    if not items:
+        return []
+
+    try:
+        client = await _get_max_user_client()
+    except Exception as exc:  # noqa: BLE001 - optional fallback must not break MAX bot mode
+        return [
+            _max_result(
+                item,
+                None,
+                None,
+                "auth_required",
+                f"MAX user-сессия не авторизована: {_safe_error_text(exc)}",
+                source="max_bridge_user_session",
+            )
+            for item in items
+        ]
+
+    output: list[dict[str, Any]] = []
+    grouped: dict[str, list[MaxStatsItem]] = defaultdict(list)
+    direct_without_chat: list[MaxStatsItem] = []
+
+    for item in items:
+        if item.chat_id:
+            grouped[f"chat:{item.chat_id}"].append(item)
+        elif item.channel:
+            grouped[f"channel:{item.channel.lower()}"].append(item)
+        else:
+            direct_without_chat.append(item)
+
+    for item in direct_without_chat:
+        output.append(
+            _max_result(
+                item,
+                None,
+                None,
+                "manual_required",
+                "MAX user-сессии нужен chat_id или публичный канал из ссылки.",
+                source="max_bridge_user_session",
+            )
+        )
+
+    for raw_group in grouped.values():
+        group = await _hydrate_max_public_texts(raw_group)
+        chat_id = await _resolve_max_user_chat_id(client, group[0])
+        if not chat_id:
+            output.extend(
+                [
+                    _max_result(
+                        item,
+                        None,
+                        None,
+                        "manual_required",
+                        "MAX user-сессия не смогла открыть канал по публичной ссылке.",
+                        source="max_bridge_user_session",
+                    )
+                    for item in group
+                ]
+            )
+            continue
+
+        with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
+        scan = await _scan_max_user_chat(client, chat_id, with_chat_id)
+        if not scan["ok"]:
+            output.extend(
+                [
+                    _max_result(
+                        item,
+                        None,
+                        None,
+                        _status_from_http(int(scan.get("http_status") or 0)),
+                        scan.get("error") or "MAX user-сессия не смогла прочитать историю канала.",
+                        source="max_bridge_user_session",
+                    )
+                    for item in with_chat_id
+                ]
+            )
+            continue
+
+        messages = scan["messages"]
+        for item in with_chat_id:
+            message = _find_max_message(messages, item.url, str(item.message_id or ""), item.public_text)
+            if message is None and item.message_id and str(item.message_id).isdigit():
+                try:
+                    message = await client.get_message(int(chat_id), int(item.message_id))
+                except Exception:
+                    message = None
+
+            if message is not None:
+                output.append(await _max_result_from_user_message(client, item, chat_id, message))
+            else:
+                output.append(
+                    _max_result(
+                        item,
+                        None,
+                        None,
+                        "manual_required",
+                        _max_user_link_hint(int(scan.get("checked_count") or 0)),
+                        source="max_bridge_user_session",
+                    )
+                )
+
+    return output
+
+
+async def _max_result_from_user_message(
+    client: Any,
+    item: MaxStatsItem,
+    chat_id: str,
+    message: Any,
+) -> dict[str, Any]:
+    result = _max_result_from_message(item, message, source="max_bridge_user_session")
+    if result["status"] == "ok":
+        return result
+
+    payload = _max_message_payload(message)
+    message_id = _max_message_internal_id(payload)
+    views = await _fetch_max_user_message_views(client, chat_id, message_id)
+    reactions = await _fetch_max_user_message_reactions(client, chat_id, message_id)
+    if views is None and reactions is None:
+        return _max_result(
+            item,
+            None,
+            None,
+            "manual_required",
+            "MAX user-сессия нашла сообщение, но MAX не вернул просмотры или реакции для него.",
+            source="max_bridge_user_session",
+        )
+
+    return _max_result(
+        item,
+        views,
+        reactions,
+        "ok",
+        raw_data={"message_id": message_id, "chat_id": chat_id, "channel": item.channel},
+        source="max_bridge_user_session",
+    )
+
+
+async def _fetch_max_user_message_views(client: Any, chat_id: str, message_id: int | None) -> int | None:
+    if message_id is None:
+        return None
+    try:
+        from pymax.protocol import Opcode
+    except ImportError:
+        return None
+
+    try:
+        response = await client._app.invoke(  # noqa: SLF001 - PyMax has no public wrapper for MSG_GET_STAT
+            Opcode.MSG_GET_STAT,
+            {"chatId": int(chat_id), "messageIds": [int(message_id)]},
+        )
+    except Exception:
+        return None
+
+    payload = _max_message_payload(getattr(response, "payload", response))
+    stats = payload.get("stats") if isinstance(payload, dict) else None
+    if isinstance(stats, dict):
+        item_stats = stats.get(str(message_id)) or stats.get(int(message_id))
+        if isinstance(item_stats, dict):
+            return _first_int(item_stats, ["views", "view_count", "views_count"])
+    return _first_int(payload, ["stats.views", "views", "view_count"]) if isinstance(payload, dict) else None
+
+
+async def _fetch_max_user_message_reactions(client: Any, chat_id: str, message_id: int | None) -> int | None:
+    if message_id is None:
+        return None
+    try:
+        response = await client.get_reactions(int(chat_id), [int(message_id)])
+    except Exception:
+        return None
+
+    payload = _max_message_payload(response)
+    reaction_info = None
+    if isinstance(payload, dict):
+        reaction_info = payload.get(str(message_id)) or payload.get(int(message_id))
+    else:
+        reaction_info = payload
+
+    return _first_int(
+        reaction_info,
+        [
+            "total_count",
+            "totalCount",
+            "reaction_info.total_count",
+            "reactionInfo.totalCount",
+            "reactions",
+            "reaction_count",
+        ],
+    )
+
+
+async def _get_max_user_client() -> Any:
+    global _max_user_client
+
+    async with _max_user_client_lock:
+        if _max_user_client is not None and _max_user_client_started(_max_user_client):
+            return _max_user_client
+
+        session_json = _max_user_session_json()
+        token = os.getenv("MAX_USER_TOKEN", "").strip()
+        if not session_json and not token:
+            raise RuntimeError("MAX_USER_SESSION_JSON или MAX_USER_TOKEN не заполнен.")
+
+        try:
+            from pymax import ExtraConfig, WebClient
+            from pymax.session import InMemoryStore
+            from pymax.session.models import SessionInfo
+        except ImportError as exc:
+            raise RuntimeError("Не установлена библиотека maxapi-python для MAX user-сессии.") from exc
+
+        timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "25"))
+        work_dir = os.getenv("MAX_USER_WORK_DIR", "/tmp/max-user-session").strip() or "/tmp/max-user-session"
+        session_name = os.getenv("MAX_USER_SESSION_NAME", "max_user_session.db").strip() or "max_user_session.db"
+        store = None
+
+        if session_json:
+            try:
+                session_info = SessionInfo.model_validate(json.loads(session_json))
+            except Exception as exc:  # noqa: BLE001 - keep error human-readable
+                raise RuntimeError("MAX_USER_SESSION_JSON заполнен невалидной сессией.") from exc
+            store = InMemoryStore()
+            await store.save_session(session_info)
+            extra_config = ExtraConfig(
+                store=store,
+                persist_session=True,
+                reconnect=False,
+                relogin=False,
+                telemetry=False,
+                request_timeout=timeout,
+                log_level=os.getenv("MAX_USER_LOG_LEVEL", "WARNING"),
+            )
+        else:
+            extra_config = ExtraConfig(
+                token=token,
+                persist_session=False,
+                reconnect=False,
+                relogin=False,
+                telemetry=False,
+                request_timeout=timeout,
+                log_level=os.getenv("MAX_USER_LOG_LEVEL", "WARNING"),
+            )
+
+        _max_user_client = WebClient(
+            work_dir=work_dir,
+            session_name=session_name,
+            extra_config=extra_config,
+        )
+        await _max_user_client.connect()
+        return _max_user_client
+
+
+def _max_user_client_started(client: Any) -> bool:
+    app_object = getattr(client, "_app", None)
+    return bool(getattr(app_object, "started", False))
+
+
+async def _resolve_max_user_chat_id(client: Any, item: MaxStatsItem) -> str | None:
+    if item.chat_id:
+        return item.chat_id
+    if not item.channel:
+        return None
+
+    cached = _max_user_chat_ids.get(item.channel.lower()) or _max_chat_id_from_env(item.channel)
+    if cached:
+        return cached
+
+    if os.getenv("MAX_USER_AUTO_JOIN", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+
+    channel_url = _max_channel_url(item.channel)
+    try:
+        chat = await client.join_channel(channel_url)
+    except Exception:
+        chat = await _find_max_user_chat_by_channel(client, item.channel)
+    chat_id = _chat_id_from_object(chat)
+    if chat_id:
+        _max_user_chat_ids[item.channel.lower()] = chat_id
+    return chat_id
+
+
+async def _find_max_user_chat_by_channel(client: Any, channel: str) -> Any | None:
+    try:
+        chats = list(getattr(client, "chats", None) or [])
+        chats.extend(await client.fetch_chats())
+    except Exception:
+        return None
+
+    normalized = channel.strip().lstrip("@").lower()
+    for chat in chats:
+        payload = _max_message_payload(chat)
+        candidates = [
+            str(payload.get("link") or ""),
+            str(payload.get("public_link") or ""),
+            str(payload.get("publicLink") or ""),
+            str(payload.get("url") or ""),
+            str(payload.get("description") or ""),
+            str(payload.get("title") or ""),
+        ]
+        if any(normalized and normalized in value.lower() for value in candidates):
+            return chat
+    return None
+
+
+async def _scan_max_user_chat(client: Any, chat_id: str, items: list[MaxStatsItem]) -> dict[str, Any]:
+    pages = max(1, int(os.getenv("MAX_USER_SCAN_PAGES", os.getenv("MAX_CHAT_SCAN_PAGES", "20"))))
+    page_size = max(1, min(100, int(os.getenv("MAX_USER_SCAN_PAGE_SIZE", os.getenv("MAX_CHAT_SCAN_PAGE_SIZE", "100")))))
+    cursor_ms: int | None = None
+    seen_pages: set[str] = set()
+    messages: list[Any] = []
+
+    for _ in range(pages):
+        try:
+            page = await client.fetch_history(
+                chat_id=int(chat_id),
+                backward=page_size,
+                from_time=cursor_ms,
+                get_chat=False,
+                get_messages=True,
+                interactive=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "http_status": 0,
+                "messages": _merge_max_messages(messages),
+                "checked_count": len(_merge_max_messages(messages)),
+                "error": f"MAX user-сессия не смогла получить историю: {_safe_error_text(exc)}",
+            }
+
+        if not page:
+            break
+
+        signature = "|".join(_max_message_identity(message) for message in page[:10])
+        if signature in seen_pages:
+            break
+        seen_pages.add(signature)
+        messages.extend(page)
+        unique_messages = _merge_max_messages(messages)
+
+        if _all_max_items_found(unique_messages, items):
+            break
+
+        oldest = _oldest_max_message_timestamp_ms(page)
+        if oldest is None:
+            break
+        next_cursor = oldest - 1
+        if cursor_ms is not None and next_cursor >= cursor_ms:
+            break
+        cursor_ms = next_cursor
+
+    unique_messages = _merge_max_messages(messages)
+    return {"ok": True, "http_status": 200, "messages": unique_messages, "checked_count": len(unique_messages), "error": None}
+
+
+def _max_user_session_configured() -> bool:
+    return bool(
+        os.getenv("MAX_USER_SESSION_JSON_B64", "").strip()
+        or os.getenv("MAX_USER_SESSION_JSON", "").strip()
+        or os.getenv("MAX_USER_TOKEN", "").strip()
+    )
+
+
+def _max_user_session_json() -> str:
+    encoded = os.getenv("MAX_USER_SESSION_JSON_B64", "").strip()
+    if encoded:
+        try:
+            return base64.b64decode(encoded).decode("utf-8")
+        except Exception:
+            return ""
+    return os.getenv("MAX_USER_SESSION_JSON", "").strip()
+
+
+def _max_user_link_hint(checked_count: int) -> str:
+    checked = checked_count or max(1, int(os.getenv("MAX_USER_SCAN_PAGES", os.getenv("MAX_CHAT_SCAN_PAGES", "20")))) * max(
+        1,
+        min(100, int(os.getenv("MAX_USER_SCAN_PAGE_SIZE", os.getenv("MAX_CHAT_SCAN_PAGE_SIZE", "100")))),
+    )
+    return (
+        f"MAX user-сессия открыла канал, но не нашла этот пост среди {checked} последних сообщений. "
+        "Увеличьте MAX_USER_SCAN_PAGES или внесите цифры через импорт."
+    )
+
+
+def _max_channel_url(channel: str) -> str:
+    return f"https://max.ru/{channel.strip().lstrip('@')}"
+
+
+def _chat_id_from_object(chat: Any) -> str | None:
+    payload = _max_message_payload(chat)
+    value = payload.get("id") or payload.get("chat_id") or payload.get("chatId")
+    return str(value) if value is not None and str(value).strip() else None
+
+
 async def _fetch_max_chat_by_link(chat_link: str, token: str) -> dict[str, Any]:
     endpoint = f"https://platform-api2.max.ru/chats/{quote(chat_link.lstrip('@'), safe='')}"
     return await _max_get_json(endpoint, token)
@@ -612,6 +1026,7 @@ def _max_result(
     status: str,
     error: str | None = None,
     raw_data: Any = None,
+    source: str = "max_bridge_platform_api",
 ) -> dict[str, Any]:
     if status != "ok":
         views = None
@@ -624,20 +1039,41 @@ def _max_result(
         "reactions": reactions,
         "status": status,
         "error": error,
-        "source": "max_bridge_platform_api",
+        "source": source,
         "precision": "exact" if status == "ok" else "unknown",
         "raw_data": raw_data,
     }
 
 
-def _max_result_from_message(item: MaxStatsItem, message: Any) -> dict[str, Any]:
-    views = _first_int(message, ["stat.views", "stats.views", "statistics.views", "views", "view_count"])
+def _max_result_from_message(
+    item: MaxStatsItem,
+    message: Any,
+    source: str = "max_bridge_platform_api",
+) -> dict[str, Any]:
+    message = _max_message_payload(message)
+    views = _first_int(
+        message,
+        [
+            "stat.views",
+            "stats.views",
+            "stats.view_count",
+            "stats.views_count",
+            "statistics.views",
+            "statistics.view_count",
+            "views",
+            "view_count",
+        ],
+    )
     reactions = _first_int(
         message,
         [
             "stat.reactions",
             "stats.reactions",
+            "stats.reaction_count",
             "statistics.reactions",
+            "statistics.reaction_count",
+            "reaction_info.total_count",
+            "reactionInfo.totalCount",
             "reactions",
             "reaction_count",
             "likes",
@@ -654,6 +1090,7 @@ def _max_result_from_message(item: MaxStatsItem, message: Any) -> dict[str, Any]
             None,
             "manual_required",
             "MAX API нашёл сообщение, но не вернул просмотры или реакции. Обычно это значит, что боту не хватает доступа к статистике канала.",
+            source=source,
         )
 
     return _max_result(
@@ -662,6 +1099,7 @@ def _max_result_from_message(item: MaxStatsItem, message: Any) -> dict[str, Any]
         reactions,
         "ok",
         raw_data={"message_id": item.message_id, "chat_id": item.chat_id, "channel": item.channel},
+        source=source,
     )
 
 
@@ -899,6 +1337,7 @@ def _oldest_max_message_timestamp_ms(messages: list[Any]) -> int | None:
 
 
 def _max_message_timestamp_ms(message: Any) -> int | None:
+    message = _max_message_payload(message)
     timestamp = _first_int(
         message,
         [
@@ -920,6 +1359,7 @@ def _max_message_timestamp_ms(message: Any) -> int | None:
 
 
 def _max_chat_id_from_payload(payload: Any) -> str | None:
+    payload = _max_message_payload(payload)
     direct_paths = [
         "chat_id",
         "chatId",
@@ -954,6 +1394,7 @@ def _max_update_looks_like_channel(payload: Any) -> bool:
 def _find_values_by_key(value: Any, keys: set[str], depth: int = 0) -> list[Any]:
     if depth > 6:
         return []
+    value = _max_message_payload(value)
     if isinstance(value, dict):
         found: list[Any] = []
         for key, child in value.items():
@@ -970,6 +1411,7 @@ def _find_values_by_key(value: Any, keys: set[str], depth: int = 0) -> list[Any]
 
 
 def _max_message_identity(message: Any) -> str:
+    message = _max_message_payload(message)
     if not isinstance(message, dict):
         return str(hash(str(message)))
     fields = [
@@ -985,6 +1427,24 @@ def _max_message_identity(message: Any) -> str:
     return "|".join(str(value) for value in fields if value is not None) or str(_max_message_timestamp_ms(message) or "")
 
 
+def _max_message_internal_id(message: Any) -> int | None:
+    message = _max_message_payload(message)
+    if not isinstance(message, dict):
+        return None
+    return _first_int(
+        message,
+        [
+            "id",
+            "message_id",
+            "messageId",
+            "mid",
+            "body.mid",
+            "body.message_id",
+            "body.messageId",
+        ],
+    )
+
+
 def _extract_max_message(
     payload: Any,
     url: str,
@@ -992,6 +1452,7 @@ def _extract_max_message(
     require_matching_message: bool,
     public_text: str | None = None,
 ) -> Any | None:
+    payload = _max_message_payload(payload)
     root = payload if isinstance(payload, dict) else {}
     messages = (
         root.get("messages")
@@ -1013,6 +1474,7 @@ def _extract_max_message(
 
 
 def _is_max_message_match(message: Any, url: str, message_id: str, public_text: str | None = None) -> bool:
+    message = _max_message_payload(message)
     if not isinstance(message, dict):
         return False
 
@@ -1075,6 +1537,7 @@ def _max_public_text_matches_message(message: Any, public_text: str | None) -> b
 def _max_text_strings(value: Any, depth: int = 0) -> list[str]:
     if depth > 5:
         return []
+    value = _max_message_payload(value)
     if isinstance(value, str):
         cleaned = _clean_max_html_text(value)
         return [cleaned] if len(cleaned) >= 20 else []
@@ -1141,7 +1604,8 @@ def _max_public_link_hint(
     return (
         "MAX-ссылка содержит публичный код поста, а не внутренний message_id. "
         f"Я попробовал найти пост среди {checked} канала через chat_id, но MAX API не вернул совпадение.{text_part} "
-        "Для точных цифр добавьте бота в канал с доступом к сообщениям или используйте MAX-ссылку формата /c/<chat_id>/<message_id>, если она доступна."
+        "Для точных цифр настройте служебную MAX user-сессию, добавьте бота в канал с доступом к сообщениям "
+        "или используйте MAX-ссылку формата /c/<chat_id>/<message_id>, если она доступна."
     )
 
 
@@ -1150,7 +1614,8 @@ def _max_chat_lookup_hint(item: MaxStatsItem, error: str | None) -> str:
     return (
         "MAX не дал автоматически получить chat_id канала по публичной ссылке."
         f"{reason} "
-        "Для точных просмотров бот должен быть добавлен в канал администратором, а chat_id канала нужно получить из события бота или указать в переменной MAX_CHANNEL_CHAT_IDS."
+        "Для точных просмотров настройте служебную MAX user-сессию. Альтернатива: бот должен быть добавлен "
+        "в канал администратором, а chat_id канала нужно получить из события бота или указать в переменной MAX_CHANNEL_CHAT_IDS."
     )
 
 
@@ -1221,6 +1686,7 @@ def _first_value(source: Any, paths: list[str]) -> Any:
 def _value_at_path(source: Any, path: str) -> Any:
     value = source
     for part in path.split("."):
+        value = _max_message_payload(value)
         if not isinstance(value, dict):
             return None
         value = value.get(part)
@@ -1261,6 +1727,34 @@ def _normalize_url_for_compare(url: str) -> str:
     if not re.match(r"^https?://", value, re.I):
         value = f"https://{value}"
     return value
+
+
+def _max_item_key(item: MaxStatsItem) -> str:
+    return f"{item.id}:{_normalize_url_for_compare(item.url)}"
+
+
+def _max_message_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(mode="python", by_alias=False)
+        except TypeError:
+            try:
+                return value.model_dump()
+            except Exception:
+                return value
+    if hasattr(value, "dict"):
+        try:
+            return value.dict()
+        except Exception:
+            return value
+    return value
+
+
+def _safe_error_text(exc: Exception) -> str:
+    text = str(exc).strip()
+    if not text:
+        return exc.__class__.__name__
+    return re.sub(r"[\r\n\t]+", " ", text)[:400]
 
 
 def _status_from_http(status: int) -> str:

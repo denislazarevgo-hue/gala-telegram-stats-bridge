@@ -1,5 +1,10 @@
 .env
 telegram_session_string.txt
+max_user_session.json
+max_user_session_b64.txt
+max_login_qr.svg
+max_login_qr.html
+max_user_session_cache/
 *.session
 *.session-journal
 __pycache__/
