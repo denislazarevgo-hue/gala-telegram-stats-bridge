@@ -8,6 +8,7 @@ from app import (
     _extract_max_chat_id,
     _extract_max_messages_list,
     _is_max_message_match,
+    _max_chat_id_from_env,
     _max_public_text_from_html,
     _max_error_or_hint,
     _max_message_timestamp_ms,
@@ -55,6 +56,12 @@ def test_extract_public_text_from_max_html():
     html = '<meta property="og:description" content="#НашиРебята Алексей и Оксана рассказывают о работе в тылу ради победы.">'
 
     assert _max_public_text_from_html(html) == "#НашиРебята Алексей и Оксана рассказывают о работе в тылу ради победы."
+
+
+def test_max_chat_id_from_env(monkeypatch):
+    monkeypatch.setenv("MAX_CHANNEL_CHAT_IDS", "Other:111, @NeoficialniyBeZsonoV:-222")
+
+    assert _max_chat_id_from_env("neoficialniybezsonov") == "-222"
 
 
 def test_invalid_message_id_becomes_public_link_hint():

@@ -310,19 +310,26 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
 
     for group in grouped.values():
         chat_id = group[0].chat_id
+        chat_lookup_error: str | None = None
         if not chat_id and group[0].channel:
-            chat = await _fetch_max_chat_by_link(group[0].channel, token)
-            if chat["http_status"] == 429:
-                output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in group])
-                continue
-            if chat["ok"]:
-                chat_id = _extract_max_chat_id(chat["json"])
-            elif chat["http_status"] in (401, 403):
-                output.extend([
-                    _max_result(item, None, None, "auth_required", "MAX не дал боту доступ к этому каналу. Проверьте, что бот добавлен в канал.")
-                    for item in group
-                ])
-                continue
+            chat_id = _max_chat_id_from_env(group[0].channel)
+            if not chat_id:
+                chat = await _fetch_max_chat_by_link(group[0].channel, token)
+                if chat["http_status"] == 429:
+                    output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in group])
+                    continue
+                if chat["ok"]:
+                    chat_id = _extract_max_chat_id(chat["json"])
+                    if not chat_id:
+                        chat_lookup_error = "MAX ответил на запрос канала, но не вернул chat_id."
+                elif chat["http_status"] in (401, 403):
+                    output.extend([
+                        _max_result(item, None, None, "auth_required", "MAX не дал боту доступ к этому каналу. Проверьте, что бот добавлен в канал администратором.")
+                        for item in group
+                    ])
+                    continue
+                else:
+                    chat_lookup_error = chat["error"] or f"HTTP {chat['http_status']}"
 
         if chat_id:
             with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
@@ -360,7 +367,11 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
 
             direct_candidates.extend(with_chat_id)
         else:
-            direct_candidates.extend(group)
+            for item in group:
+                if _is_max_public_channel_item(item):
+                    output.append(_max_result(item, None, None, "manual_required", _max_chat_lookup_hint(item, chat_lookup_error)))
+                else:
+                    direct_candidates.append(item)
 
     output.extend(await _collect_max_direct_batch(direct_candidates, token))
     return {"items": sorted(output, key=lambda row: row.get("id") or 0)}
@@ -986,6 +997,34 @@ def _max_public_link_hint(
         f"Я попробовал найти пост среди {checked} канала через chat_id, но MAX API не вернул совпадение.{text_part} "
         "Для точных цифр добавьте бота в канал с доступом к сообщениям или используйте MAX-ссылку формата /c/<chat_id>/<message_id>, если она доступна."
     )
+
+
+def _max_chat_lookup_hint(item: MaxStatsItem, error: str | None) -> str:
+    reason = f" Ответ MAX: {error}" if error else ""
+    return (
+        "MAX не дал автоматически получить chat_id канала по публичной ссылке."
+        f"{reason} "
+        "Для точных просмотров бот должен быть добавлен в канал администратором, а chat_id канала нужно получить из события бота или указать в переменной MAX_CHANNEL_CHAT_IDS."
+    )
+
+
+def _max_chat_id_from_env(channel: str | None) -> str | None:
+    if not channel:
+        return None
+    normalized_channel = channel.strip().lstrip("@").lower()
+    raw = os.getenv("MAX_CHANNEL_CHAT_IDS", "")
+    for chunk in raw.split(","):
+        if not chunk.strip():
+            continue
+        if ":" in chunk:
+            key, value = chunk.split(":", 1)
+        elif "=" in chunk:
+            key, value = chunk.split("=", 1)
+        else:
+            continue
+        if key.strip().lstrip("@").lower() == normalized_channel and value.strip():
+            return value.strip()
+    return None
 
 
 def _is_max_public_channel_item(item: MaxStatsItem) -> bool:
