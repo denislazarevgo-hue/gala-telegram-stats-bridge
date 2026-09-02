@@ -4,7 +4,7 @@ import asyncio
 import os
 import re
 from collections import defaultdict
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from typing import Any
 
 import httpx
@@ -288,13 +288,81 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
     invalid = [
         _max_result(item, None, None, "manual_required", "Из ссылки MAX не удалось достоверно извлечь ID поста.")
         for item in normalized
-        if not item.message_id
+        if not item.message_id and not item.chat_id and not item.channel
     ]
-    valid = [item for item in normalized if item.message_id]
-    if not valid:
+    candidates = [item for item in normalized if item.message_id or item.chat_id or item.channel]
+    if not candidates:
         return {"items": invalid}
 
     output = invalid[:]
+    direct_candidates: list[MaxStatsItem] = []
+    grouped: dict[str, list[MaxStatsItem]] = defaultdict(list)
+    for item in candidates:
+        if item.chat_id:
+            grouped[f"chat:{item.chat_id}"].append(item)
+        elif item.channel:
+            grouped[f"channel:{item.channel.lower()}"].append(item)
+        else:
+            direct_candidates.append(item)
+
+    for group in grouped.values():
+        chat_id = group[0].chat_id
+        if not chat_id and group[0].channel:
+            chat = await _fetch_max_chat_by_link(group[0].channel, token)
+            if chat["http_status"] == 429:
+                output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in group])
+                continue
+            if chat["ok"]:
+                chat_id = _extract_max_chat_id(chat["json"])
+            elif chat["http_status"] in (401, 403):
+                output.extend([
+                    _max_result(item, None, None, "auth_required", "MAX не дал боту доступ к этому каналу. Проверьте, что бот добавлен в канал.")
+                    for item in group
+                ])
+                continue
+
+        if chat_id:
+            with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
+            scan = await _scan_max_chat(chat_id, with_chat_id, token)
+            if scan["http_status"] == 429:
+                output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in with_chat_id])
+                continue
+            if scan["ok"]:
+                messages = scan["messages"]
+                for item in with_chat_id:
+                    message = _find_max_message(messages, item.url, str(item.message_id or ""))
+                    if message:
+                        output.append(_max_result_from_message(item, message))
+                    elif item.message_id:
+                        direct_candidates.append(item)
+                    else:
+                        output.append(_max_result(item, None, None, "manual_required", _max_public_link_hint(item)))
+                continue
+
+            if scan["http_status"] in (401, 403):
+                output.extend([
+                    _max_result(item, None, None, "auth_required", "MAX не дал боту доступ к сообщениям этого канала.")
+                    for item in with_chat_id
+                ])
+                continue
+
+            direct_candidates.extend(with_chat_id)
+        else:
+            direct_candidates.extend(group)
+
+    output.extend(await _collect_max_direct_batch(direct_candidates, token))
+    return {"items": sorted(output, key=lambda row: row.get("id") or 0)}
+
+
+async def _collect_max_direct_batch(items: list[MaxStatsItem], token: str) -> list[dict[str, Any]]:
+    valid = [item for item in items if item.message_id]
+    if not valid:
+        return [
+            _max_result(item, None, None, "manual_required", _max_public_link_hint(item))
+            for item in items
+        ]
+
+    output: list[dict[str, Any]] = []
     chunk_size = max(1, int(os.getenv("MAX_BATCH_CHUNK_SIZE", "100")))
     for start in range(0, len(valid), chunk_size):
         chunk = valid[start : start + chunk_size]
@@ -304,7 +372,7 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
             continue
         if not data["ok"]:
             status = _status_from_http(data["http_status"])
-            output.extend([_max_result(item, None, None, status, data["error"]) for item in chunk])
+            output.extend([_max_result(item, None, None, status, _max_error_or_hint(item, data["error"])) for item in chunk])
             continue
 
         for item in chunk:
@@ -314,7 +382,7 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
                 if single["ok"]:
                     message = _extract_max_message(single["json"], item.url, str(item.message_id), require_matching_message=False)
                 elif single["http_status"] in (401, 403, 404, 429):
-                    output.append(_max_result(item, None, None, _status_from_http(single["http_status"]), single["error"]))
+                    output.append(_max_result(item, None, None, _status_from_http(single["http_status"]), _max_error_or_hint(item, single["error"])))
                     continue
 
             if not message:
@@ -322,7 +390,61 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
                 continue
             output.append(_max_result_from_message(item, message))
 
-    return {"items": sorted(output, key=lambda row: row.get("id") or 0)}
+    return output
+
+
+async def _fetch_max_chat_by_link(chat_link: str, token: str) -> dict[str, Any]:
+    endpoint = f"https://platform-api2.max.ru/chats/{quote(chat_link.lstrip('@'), safe='')}"
+    return await _max_get_json(endpoint, token)
+
+
+async def _fetch_max_chat_messages(chat_id: str, token: str, before_ms: int | None = None) -> dict[str, Any]:
+    endpoint = "https://platform-api2.max.ru/messages"
+    count = max(1, min(100, int(os.getenv("MAX_CHAT_SCAN_PAGE_SIZE", "100"))))
+    params = {"chat_id": str(chat_id), "count": str(count)}
+    if before_ms is not None:
+        params["from"] = str(before_ms)
+    return await _max_get_json(endpoint, token, params=params)
+
+
+async def _scan_max_chat(chat_id: str, items: list[MaxStatsItem], token: str) -> dict[str, Any]:
+    pages = max(1, int(os.getenv("MAX_CHAT_SCAN_PAGES", "20")))
+    before_ms: int | None = None
+    seen_pages: set[str] = set()
+    messages: list[Any] = []
+
+    for _ in range(pages):
+        data = await _fetch_max_chat_messages(chat_id, token, before_ms)
+        if not data["ok"]:
+            return {
+                "ok": False,
+                "http_status": data["http_status"],
+                "messages": messages,
+                "error": data["error"],
+            }
+
+        page = _extract_max_messages_list(data["json"])
+        if not page:
+            break
+
+        signature = "|".join(_max_message_identity(message) for message in page[:10])
+        if signature in seen_pages:
+            break
+        seen_pages.add(signature)
+        messages.extend(page)
+
+        if all(_find_max_message(messages, item.url, str(item.message_id or "")) for item in items):
+            break
+
+        oldest = _oldest_max_message_timestamp_ms(page)
+        if oldest is None:
+            break
+        next_before = oldest - 1
+        if before_ms is not None and next_before >= before_ms:
+            break
+        before_ms = next_before
+
+    return {"ok": True, "http_status": 200, "messages": messages, "error": None}
 
 
 async def _fetch_max_messages(message_ids: list[str], token: str) -> dict[str, Any]:
@@ -473,6 +595,101 @@ def _parse_max_url(url: str) -> tuple[str | None, str | None, str | None]:
     return message_id, chat_id, channel
 
 
+def _max_item_with_chat_id(item: MaxStatsItem, chat_id: str) -> MaxStatsItem:
+    return MaxStatsItem(
+        id=item.id,
+        url=item.url,
+        messageId=item.message_id,
+        chatId=chat_id,
+        channel=item.channel,
+    )
+
+
+def _extract_max_chat_id(payload: Any) -> str | None:
+    root = payload if isinstance(payload, dict) else {}
+    candidates = [
+        root,
+        root.get("chat") if isinstance(root, dict) else None,
+        _dict_get(root, "data", "chat"),
+        _dict_get(root, "response", "chat"),
+        root.get("data") if isinstance(root, dict) else None,
+        root.get("response") if isinstance(root, dict) else None,
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        value = candidate.get("chat_id") or candidate.get("chatId") or candidate.get("id")
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _extract_max_messages_list(payload: Any) -> list[Any]:
+    root = payload if isinstance(payload, dict) else {}
+    candidates = [
+        root.get("messages") if isinstance(root, dict) else None,
+        root.get("items") if isinstance(root, dict) else None,
+        _dict_get(root, "data", "messages"),
+        _dict_get(root, "data", "items"),
+        _dict_get(root, "response", "messages"),
+        _dict_get(root, "response", "items"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return candidate
+    return []
+
+
+def _find_max_message(messages: list[Any], url: str, message_id: str) -> Any | None:
+    for message in messages:
+        if _is_max_message_match(message, url, message_id):
+            return message
+    return None
+
+
+def _oldest_max_message_timestamp_ms(messages: list[Any]) -> int | None:
+    timestamps = [_max_message_timestamp_ms(message) for message in messages]
+    usable = [timestamp for timestamp in timestamps if timestamp is not None]
+    return min(usable) if usable else None
+
+
+def _max_message_timestamp_ms(message: Any) -> int | None:
+    timestamp = _first_int(
+        message,
+        [
+            "timestamp",
+            "time",
+            "date",
+            "created_at",
+            "createdAt",
+            "body.timestamp",
+            "body.time",
+            "body.date",
+            "body.created_at",
+            "body.createdAt",
+        ],
+    )
+    if timestamp is None:
+        return None
+    return timestamp * 1000 if timestamp < 10**12 else timestamp
+
+
+def _max_message_identity(message: Any) -> str:
+    if not isinstance(message, dict):
+        return str(hash(str(message)))
+    fields = [
+        message.get("id"),
+        message.get("message_id"),
+        message.get("messageId"),
+        message.get("mid"),
+        message.get("url"),
+        message.get("link"),
+        _dict_get(message, "body", "mid"),
+        _dict_get(message, "body", "message_id"),
+    ]
+    return "|".join(str(value) for value in fields if value is not None) or str(_max_message_timestamp_ms(message) or "")
+
+
 def _extract_max_message(payload: Any, url: str, message_id: str, require_matching_message: bool) -> Any | None:
     root = payload if isinstance(payload, dict) else {}
     messages = (
@@ -525,6 +742,37 @@ def _is_max_message_match(message: Any, url: str, message_id: str) -> bool:
         and value.strip()
         and (_normalize_url_for_compare(value) == normalized or message_id in value)
         for value in url_fields
+    ) or (bool(message_id) and _payload_contains_string(message, message_id))
+
+
+def _payload_contains_string(value: Any, needle: str, depth: int = 0) -> bool:
+    if depth > 6:
+        return False
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, dict):
+        return any(_payload_contains_string(child, needle, depth + 1) for child in value.values())
+    if isinstance(value, list):
+        return any(_payload_contains_string(child, needle, depth + 1) for child in value)
+    return False
+
+
+def _max_error_or_hint(item: MaxStatsItem, error: str | None) -> str:
+    if error and "invalid message_id" not in error.lower():
+        return error
+    if item.channel or item.chat_id:
+        return _max_public_link_hint(item)
+    return error or "MAX API не принял message_id из ссылки."
+
+
+def _max_public_link_hint(item: MaxStatsItem) -> str:
+    scan_pages = max(1, int(os.getenv("MAX_CHAT_SCAN_PAGES", "20")))
+    page_size = max(1, min(100, int(os.getenv("MAX_CHAT_SCAN_PAGE_SIZE", "100"))))
+    scanned = scan_pages * page_size
+    return (
+        "MAX-ссылка содержит публичный код поста, а не внутренний message_id. "
+        f"Я попробовал найти пост среди последних {scanned} сообщений канала через chat_id, но MAX API не вернул совпадение. "
+        "Для точных цифр добавьте бота в канал с доступом к сообщениям или используйте MAX-ссылку формата /c/<chat_id>/<message_id>, если она доступна."
     )
 
 
