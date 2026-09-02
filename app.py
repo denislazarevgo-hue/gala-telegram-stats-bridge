@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import os
 import re
 from collections import defaultdict
-from urllib.parse import quote, unquote, urlparse
 from typing import Any
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
@@ -43,6 +44,7 @@ class MaxStatsItem(BaseModel):
     message_id: str | None = Field(default=None, alias="messageId")
     chat_id: str | None = Field(default=None, alias="chatId")
     channel: str | None = None
+    public_text: str | None = Field(default=None, alias="publicText")
 
     class Config:
         populate_by_name = True
@@ -282,6 +284,7 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
                 messageId=item.message_id or parsed_id,
                 chatId=item.chat_id or parsed_chat_id,
                 channel=item.channel or parsed_channel,
+                publicText=item.public_text,
             )
         )
 
@@ -323,6 +326,7 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
 
         if chat_id:
             with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
+            with_chat_id = await _hydrate_max_public_texts(with_chat_id)
             scan = await _scan_max_chat(chat_id, with_chat_id, token)
             if scan["http_status"] == 429:
                 output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in with_chat_id])
@@ -330,13 +334,21 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
             if scan["ok"]:
                 messages = scan["messages"]
                 for item in with_chat_id:
-                    message = _find_max_message(messages, item.url, str(item.message_id or ""))
+                    message = _find_max_message(messages, item.url, str(item.message_id or ""), item.public_text)
                     if message:
                         output.append(_max_result_from_message(item, message))
-                    elif item.message_id:
+                    elif item.message_id and not _is_max_public_channel_item(item):
                         direct_candidates.append(item)
                     else:
-                        output.append(_max_result(item, None, None, "manual_required", _max_public_link_hint(item)))
+                        output.append(
+                            _max_result(
+                                item,
+                                None,
+                                None,
+                                "manual_required",
+                                _max_public_link_hint(item, checked_count=scan.get("checked_count"), used_public_text=bool(item.public_text)),
+                            )
+                        )
                 continue
 
             if scan["http_status"] in (401, 403):
@@ -358,7 +370,7 @@ async def _collect_max_direct_batch(items: list[MaxStatsItem], token: str) -> li
     valid = [item for item in items if item.message_id]
     if not valid:
         return [
-            _max_result(item, None, None, "manual_required", _max_public_link_hint(item))
+            _max_result(item, None, None, "manual_required", _max_public_link_hint(item, used_public_text=bool(item.public_text)))
             for item in items
         ]
 
@@ -376,11 +388,11 @@ async def _collect_max_direct_batch(items: list[MaxStatsItem], token: str) -> li
             continue
 
         for item in chunk:
-            message = _extract_max_message(data["json"], item.url, str(item.message_id), require_matching_message=True)
+            message = _extract_max_message(data["json"], item.url, str(item.message_id), require_matching_message=True, public_text=item.public_text)
             if not message:
                 single = await _fetch_max_message(str(item.message_id), token)
                 if single["ok"]:
-                    message = _extract_max_message(single["json"], item.url, str(item.message_id), require_matching_message=False)
+                    message = _extract_max_message(single["json"], item.url, str(item.message_id), require_matching_message=False, public_text=item.public_text)
                 elif single["http_status"] in (401, 403, 404, 429):
                     output.append(_max_result(item, None, None, _status_from_http(single["http_status"]), _max_error_or_hint(item, single["error"])))
                     continue
@@ -398,28 +410,53 @@ async def _fetch_max_chat_by_link(chat_link: str, token: str) -> dict[str, Any]:
     return await _max_get_json(endpoint, token)
 
 
-async def _fetch_max_chat_messages(chat_id: str, token: str, before_ms: int | None = None) -> dict[str, Any]:
+async def _fetch_max_chat_messages(
+    chat_id: str,
+    token: str,
+    cursor_ms: int | None = None,
+    cursor_param: str = "from",
+) -> dict[str, Any]:
     endpoint = "https://platform-api2.max.ru/messages"
     count = max(1, min(100, int(os.getenv("MAX_CHAT_SCAN_PAGE_SIZE", "100"))))
     params = {"chat_id": str(chat_id), "count": str(count)}
-    if before_ms is not None:
-        params["from"] = str(before_ms)
+    if cursor_ms is not None:
+        params[cursor_param] = str(cursor_ms)
     return await _max_get_json(endpoint, token, params=params)
 
 
 async def _scan_max_chat(chat_id: str, items: list[MaxStatsItem], token: str) -> dict[str, Any]:
+    primary = await _scan_max_chat_cursor(chat_id, items, token, "from")
+    if not primary["ok"] or _all_max_items_found(primary["messages"], items):
+        return primary
+
+    secondary = await _scan_max_chat_cursor(chat_id, items, token, "to")
+    if not secondary["ok"]:
+        return primary
+
+    messages = _merge_max_messages(primary["messages"] + secondary["messages"])
+    return {
+        "ok": True,
+        "http_status": 200,
+        "messages": messages,
+        "checked_count": len(messages),
+        "error": None,
+    }
+
+
+async def _scan_max_chat_cursor(chat_id: str, items: list[MaxStatsItem], token: str, cursor_param: str) -> dict[str, Any]:
     pages = max(1, int(os.getenv("MAX_CHAT_SCAN_PAGES", "20")))
-    before_ms: int | None = None
+    cursor_ms: int | None = None
     seen_pages: set[str] = set()
     messages: list[Any] = []
 
     for _ in range(pages):
-        data = await _fetch_max_chat_messages(chat_id, token, before_ms)
+        data = await _fetch_max_chat_messages(chat_id, token, cursor_ms, cursor_param)
         if not data["ok"]:
             return {
                 "ok": False,
                 "http_status": data["http_status"],
-                "messages": messages,
+                "messages": _merge_max_messages(messages),
+                "checked_count": len(_merge_max_messages(messages)),
                 "error": data["error"],
             }
 
@@ -432,19 +469,21 @@ async def _scan_max_chat(chat_id: str, items: list[MaxStatsItem], token: str) ->
             break
         seen_pages.add(signature)
         messages.extend(page)
+        unique_messages = _merge_max_messages(messages)
 
-        if all(_find_max_message(messages, item.url, str(item.message_id or "")) for item in items):
+        if _all_max_items_found(unique_messages, items):
             break
 
         oldest = _oldest_max_message_timestamp_ms(page)
         if oldest is None:
             break
-        next_before = oldest - 1
-        if before_ms is not None and next_before >= before_ms:
+        next_cursor = oldest - 1
+        if cursor_ms is not None and next_cursor >= cursor_ms:
             break
-        before_ms = next_before
+        cursor_ms = next_cursor
 
-    return {"ok": True, "http_status": 200, "messages": messages, "error": None}
+    unique_messages = _merge_max_messages(messages)
+    return {"ok": True, "http_status": 200, "messages": unique_messages, "checked_count": len(unique_messages), "error": None}
 
 
 async def _fetch_max_messages(message_ids: list[str], token: str) -> dict[str, Any]:
@@ -602,7 +641,93 @@ def _max_item_with_chat_id(item: MaxStatsItem, chat_id: str) -> MaxStatsItem:
         messageId=item.message_id,
         chatId=chat_id,
         channel=item.channel,
+        publicText=item.public_text,
     )
+
+
+async def _hydrate_max_public_texts(items: list[MaxStatsItem]) -> list[MaxStatsItem]:
+    if not _max_public_page_fallback_enabled():
+        return items
+
+    candidates = [item for item in items if _is_max_public_channel_item(item) and not item.public_text]
+    if not candidates:
+        return items
+
+    timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "25"))
+    headers = {
+        "accept": "text/html,application/xhtml+xml",
+        "user-agent": "Gala View Report Collector MAX Bridge/1.0",
+    }
+    texts: dict[str, str | None] = {}
+    async with httpx.AsyncClient(timeout=timeout, verify=_max_verify_tls(), follow_redirects=True, headers=headers) as client:
+        for item in candidates:
+            if item.url not in texts:
+                texts[item.url] = await _fetch_max_public_text(client, item.url)
+
+    hydrated: list[MaxStatsItem] = []
+    for item in items:
+        hydrated.append(
+            MaxStatsItem(
+                id=item.id,
+                url=item.url,
+                messageId=item.message_id,
+                chatId=item.chat_id,
+                channel=item.channel,
+                publicText=item.public_text or texts.get(item.url),
+            )
+        )
+    return hydrated
+
+
+async def _fetch_max_public_text(client: httpx.AsyncClient, url: str) -> str | None:
+    try:
+        response = await client.get(_max_public_http_url(url))
+    except httpx.HTTPError:
+        return None
+    if not response.is_success:
+        return None
+    return _max_public_text_from_html(response.text)
+
+
+def _max_public_http_url(url: str) -> str:
+    value = url.strip()
+    if not re.match(r"^https?://", value, re.I):
+        value = f"https://{value}"
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return value
+    if parsed.netloc.lower() == "web.max.ru":
+        parsed = parsed._replace(netloc="max.ru")
+    return urlunparse(parsed)
+
+
+def _max_public_text_from_html(page: str) -> str | None:
+    candidates: list[str] = []
+    patterns = [
+        r"<meta[^>]+(?:property|name)=[\"'](?:og:description|description|twitter:description)[\"'][^>]+content=[\"']([^\"']+)[\"']",
+        r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"'](?:og:description|description|twitter:description)[\"']",
+        r"<span[^>]*>(.*?)</span>",
+        r"<title[^>]*>(.*?)</title>",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, page, re.I | re.S):
+            text = _clean_max_html_text(match.group(1))
+            if len(text) >= 40:
+                candidates.append(text)
+
+    if not candidates:
+        return None
+    return max(candidates, key=len)[:4000]
+
+
+def _clean_max_html_text(value: str) -> str:
+    text = re.sub(r"<!--.*?-->", " ", value, flags=re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def _extract_max_chat_id(payload: Any) -> str | None:
@@ -640,9 +765,22 @@ def _extract_max_messages_list(payload: Any) -> list[Any]:
     return []
 
 
-def _find_max_message(messages: list[Any], url: str, message_id: str) -> Any | None:
+def _merge_max_messages(messages: list[Any]) -> list[Any]:
+    unique: dict[str, Any] = {}
     for message in messages:
-        if _is_max_message_match(message, url, message_id):
+        identity = _max_message_identity(message)
+        if identity not in unique:
+            unique[identity] = message
+    return list(unique.values())
+
+
+def _all_max_items_found(messages: list[Any], items: list[MaxStatsItem]) -> bool:
+    return all(_find_max_message(messages, item.url, str(item.message_id or ""), item.public_text) for item in items)
+
+
+def _find_max_message(messages: list[Any], url: str, message_id: str, public_text: str | None = None) -> Any | None:
+    for message in messages:
+        if _is_max_message_match(message, url, message_id, public_text):
             return message
     return None
 
@@ -690,7 +828,13 @@ def _max_message_identity(message: Any) -> str:
     return "|".join(str(value) for value in fields if value is not None) or str(_max_message_timestamp_ms(message) or "")
 
 
-def _extract_max_message(payload: Any, url: str, message_id: str, require_matching_message: bool) -> Any | None:
+def _extract_max_message(
+    payload: Any,
+    url: str,
+    message_id: str,
+    require_matching_message: bool,
+    public_text: str | None = None,
+) -> Any | None:
     root = payload if isinstance(payload, dict) else {}
     messages = (
         root.get("messages")
@@ -701,17 +845,17 @@ def _extract_max_message(payload: Any, url: str, message_id: str, require_matchi
         if not require_matching_message and len(messages) == 1:
             return messages[0]
         for message in messages:
-            if _is_max_message_match(message, url, message_id):
+            if _is_max_message_match(message, url, message_id, public_text):
                 return message
         return None
 
     direct = root.get("message") or _dict_get(root, "data", "message") or _dict_get(root, "response", "message") or payload
-    if not require_matching_message or _is_max_message_match(direct, url, message_id):
+    if not require_matching_message or _is_max_message_match(direct, url, message_id, public_text):
         return direct
     return None
 
 
-def _is_max_message_match(message: Any, url: str, message_id: str) -> bool:
+def _is_max_message_match(message: Any, url: str, message_id: str, public_text: str | None = None) -> bool:
     if not isinstance(message, dict):
         return False
 
@@ -740,9 +884,67 @@ def _is_max_message_match(message: Any, url: str, message_id: str) -> bool:
     return any(
         isinstance(value, str)
         and value.strip()
-        and (_normalize_url_for_compare(value) == normalized or message_id in value)
+        and (_normalize_url_for_compare(value) == normalized or (bool(message_id) and message_id in value))
         for value in url_fields
-    ) or (bool(message_id) and _payload_contains_string(message, message_id))
+    ) or (bool(message_id) and _payload_contains_string(message, message_id)) or _max_public_text_matches_message(message, public_text)
+
+
+def _max_public_text_matches_message(message: Any, public_text: str | None) -> bool:
+    if not public_text:
+        return False
+
+    public_normalized = _normalize_max_text(public_text)
+    if len(public_normalized) < 40:
+        return False
+
+    payload_text = _normalize_max_text(" ".join(_max_text_strings(message)))
+    if len(payload_text) < 40:
+        return False
+
+    for size in (240, 180, 120, 80):
+        if len(public_normalized) >= size and public_normalized[:size] in payload_text:
+            return True
+
+    public_words = _significant_max_words(public_normalized)
+    if len(public_words) < 10:
+        return False
+    for start in range(0, min(8, len(public_words) - 9)):
+        needle = " ".join(public_words[start : start + 10])
+        if needle and needle in payload_text:
+            return True
+    return False
+
+
+def _max_text_strings(value: Any, depth: int = 0) -> list[str]:
+    if depth > 5:
+        return []
+    if isinstance(value, str):
+        cleaned = _clean_max_html_text(value)
+        return [cleaned] if len(cleaned) >= 20 else []
+    if isinstance(value, dict):
+        output: list[str] = []
+        for child in value.values():
+            output.extend(_max_text_strings(child, depth + 1))
+        return output[:200]
+    if isinstance(value, list):
+        output = []
+        for child in value:
+            output.extend(_max_text_strings(child, depth + 1))
+        return output[:200]
+    return []
+
+
+def _normalize_max_text(value: str) -> str:
+    text = html_lib.unescape(value).lower()
+    text = text.replace("…", " ")
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^0-9a-zа-яё]+", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _significant_max_words(value: str) -> list[str]:
+    return [word for word in value.split() if len(word) >= 3]
 
 
 def _payload_contains_string(value: Any, needle: str, depth: int = 0) -> bool:
@@ -761,19 +963,44 @@ def _max_error_or_hint(item: MaxStatsItem, error: str | None) -> str:
     if error and "invalid message_id" not in error.lower():
         return error
     if item.channel or item.chat_id:
-        return _max_public_link_hint(item)
+        return _max_public_link_hint(item, used_public_text=bool(item.public_text))
     return error or "MAX API не принял message_id из ссылки."
 
 
-def _max_public_link_hint(item: MaxStatsItem) -> str:
+def _max_public_link_hint(
+    item: MaxStatsItem,
+    checked_count: int | None = None,
+    used_public_text: bool = False,
+) -> str:
     scan_pages = max(1, int(os.getenv("MAX_CHAT_SCAN_PAGES", "20")))
     page_size = max(1, min(100, int(os.getenv("MAX_CHAT_SCAN_PAGE_SIZE", "100"))))
-    scanned = scan_pages * page_size
+    planned = scan_pages * page_size
+    checked = f"{checked_count} реально полученных сообщений" if checked_count is not None else f"до {planned} последних сообщений"
+    text_part = (
+        " Также я сравнил текст публичной страницы с текстами сообщений из API."
+        if used_public_text
+        else ""
+    )
     return (
         "MAX-ссылка содержит публичный код поста, а не внутренний message_id. "
-        f"Я попробовал найти пост среди последних {scanned} сообщений канала через chat_id, но MAX API не вернул совпадение. "
+        f"Я попробовал найти пост среди {checked} канала через chat_id, но MAX API не вернул совпадение.{text_part} "
         "Для точных цифр добавьте бота в канал с доступом к сообщениям или используйте MAX-ссылку формата /c/<chat_id>/<message_id>, если она доступна."
     )
+
+
+def _is_max_public_channel_item(item: MaxStatsItem) -> bool:
+    if not item.channel:
+        return False
+    try:
+        parsed = urlparse(_max_public_http_url(item.url))
+        parts = [part for part in parsed.path.split("/") if part]
+    except ValueError:
+        return False
+    return len(parts) >= 2 and parts[0].lower() != "c"
+
+
+def _max_public_page_fallback_enabled() -> bool:
+    return os.getenv("MAX_PUBLIC_PAGE_TEXT_FALLBACK", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _max_token_from_request(request: Request) -> str:

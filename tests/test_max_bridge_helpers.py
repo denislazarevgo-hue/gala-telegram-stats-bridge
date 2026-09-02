@@ -8,6 +8,7 @@ from app import (
     _extract_max_chat_id,
     _extract_max_messages_list,
     _is_max_message_match,
+    _max_public_text_from_html,
     _max_error_or_hint,
     _max_message_timestamp_ms,
     _parse_max_url,
@@ -36,6 +37,24 @@ def test_match_public_code_inside_message_url():
     message = {"url": "https://max.ru/NeoficialniyBeZsonoV/AZ3OwQ_cBH4", "stat": {"views": 10}}
 
     assert _is_max_message_match(message, "https://max.ru/NeoficialniyBeZsonoV/AZ3OwQ_cBH4", "AZ3OwQ_cBH4")
+
+
+def test_match_public_max_post_by_text():
+    public_text = "#НашиРебята Алексей, позывной «Будулай», доброволец из Оренбургской области. История о простом русском герое."
+    message = {
+        "body": {
+            "text": "#НашиРебята Алексей, позывной Будулай, доброволец из Оренбургской области. История о простом русском герое.",
+        },
+        "stat": {"views": 123, "reactions": 7},
+    }
+
+    assert _is_max_message_match(message, "https://max.ru/NeoficialniyBeZsonoV/AZ3OwQ_cBH4", "AZ3OwQ_cBH4", public_text)
+
+
+def test_extract_public_text_from_max_html():
+    html = '<meta property="og:description" content="#НашиРебята Алексей и Оксана рассказывают о работе в тылу ради победы.">'
+
+    assert _max_public_text_from_html(html) == "#НашиРебята Алексей и Оксана рассказывают о работе в тылу ради победы."
 
 
 def test_invalid_message_id_becomes_public_link_hint():
