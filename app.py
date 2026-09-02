@@ -308,19 +308,25 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
         else:
             direct_candidates.append(item)
 
-    for group in grouped.values():
+    for raw_group in grouped.values():
+        group = await _hydrate_max_public_texts(raw_group)
         chat_id = group[0].chat_id
+        chat_ids: list[str] = [chat_id] if chat_id else []
         chat_lookup_error: str | None = None
         if not chat_id and group[0].channel:
             chat_id = _max_chat_id_from_env(group[0].channel)
-            if not chat_id:
+            if chat_id:
+                chat_ids.append(chat_id)
+            else:
                 chat = await _fetch_max_chat_by_link(group[0].channel, token)
                 if chat["http_status"] == 429:
                     output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in group])
                     continue
                 if chat["ok"]:
                     chat_id = _extract_max_chat_id(chat["json"])
-                    if not chat_id:
+                    if chat_id:
+                        chat_ids.append(chat_id)
+                    else:
                         chat_lookup_error = "MAX ответил на запрос канала, но не вернул chat_id."
                 elif chat["http_status"] in (401, 403):
                     output.extend([
@@ -331,47 +337,85 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
                 else:
                     chat_lookup_error = chat["error"] or f"HTTP {chat['http_status']}"
 
-        if chat_id:
-            with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
-            with_chat_id = await _hydrate_max_public_texts(with_chat_id)
-            scan = await _scan_max_chat(chat_id, with_chat_id, token)
-            if scan["http_status"] == 429:
-                output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in with_chat_id])
+        if not chat_ids and group[0].channel:
+            updates = await _fetch_max_updates(token)
+            if updates["http_status"] == 429:
+                output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in group])
                 continue
-            if scan["ok"]:
+            if updates["ok"]:
+                chat_ids = _max_chat_ids_from_updates(updates["json"], group)
+                if not chat_ids and not chat_lookup_error:
+                    chat_lookup_error = "MAX updates не содержат подходящий chat_id для этого канала."
+            elif updates["http_status"] in (401, 403) and not chat_lookup_error:
+                output.extend([
+                    _max_result(item, None, None, "auth_required", "MAX не дал боту доступ к updates.")
+                    for item in group
+                ])
+                continue
+            elif not chat_lookup_error:
+                chat_lookup_error = updates["error"] or f"HTTP {updates['http_status']}"
+
+        if chat_ids:
+            remaining = group
+            checked_count = 0
+            auth_blocked = False
+            for resolved_chat_id in _unique(chat_ids):
+                with_chat_id = [_max_item_with_chat_id(item, resolved_chat_id) for item in remaining]
+                scan = await _scan_max_chat(resolved_chat_id, with_chat_id, token)
+                if scan["http_status"] == 429:
+                    output.extend([_max_result(item, None, None, "rate_limited", "MAX временно ограничил запросы.") for item in with_chat_id])
+                    remaining = []
+                    break
+
+                if scan["http_status"] in (401, 403):
+                    auth_blocked = True
+                    continue
+
+                if not scan["ok"]:
+                    continue
+
                 messages = scan["messages"]
+                checked_count += int(scan.get("checked_count") or 0)
+                missed: list[MaxStatsItem] = []
                 for item in with_chat_id:
                     message = _find_max_message(messages, item.url, str(item.message_id or ""), item.public_text)
                     if message:
                         output.append(_max_result_from_message(item, message))
-                    elif item.message_id and not _is_max_public_channel_item(item):
-                        direct_candidates.append(item)
                     else:
-                        output.append(
-                            _max_result(
-                                item,
-                                None,
-                                None,
-                                "manual_required",
-                                _max_public_link_hint(item, checked_count=scan.get("checked_count"), used_public_text=bool(item.public_text)),
-                            )
-                        )
-                continue
+                        missed.append(item)
+                remaining = missed
+                if not remaining:
+                    break
 
-            if scan["http_status"] in (401, 403):
+            if remaining and auth_blocked and not checked_count:
                 output.extend([
                     _max_result(item, None, None, "auth_required", "MAX не дал боту доступ к сообщениям этого канала.")
-                    for item in with_chat_id
+                    for item in remaining
                 ])
                 continue
 
-            direct_candidates.extend(with_chat_id)
-        else:
-            for item in group:
-                if _is_max_public_channel_item(item):
-                    output.append(_max_result(item, None, None, "manual_required", _max_chat_lookup_hint(item, chat_lookup_error)))
-                else:
+            for item in remaining:
+                if item.message_id and not _is_max_public_channel_item(item):
                     direct_candidates.append(item)
+                elif checked_count:
+                    output.append(
+                        _max_result(
+                            item,
+                            None,
+                            None,
+                            "manual_required",
+                            _max_public_link_hint(item, checked_count=checked_count, used_public_text=bool(item.public_text)),
+                        )
+                    )
+                else:
+                    output.append(_max_result(item, None, None, "manual_required", _max_chat_lookup_hint(item, chat_lookup_error)))
+            continue
+
+        for item in group:
+            if _is_max_public_channel_item(item):
+                output.append(_max_result(item, None, None, "manual_required", _max_chat_lookup_hint(item, chat_lookup_error)))
+            else:
+                direct_candidates.append(item)
 
     output.extend(await _collect_max_direct_batch(direct_candidates, token))
     return {"items": sorted(output, key=lambda row: row.get("id") or 0)}
@@ -432,6 +476,13 @@ async def _fetch_max_chat_messages(
     params = {"chat_id": str(chat_id), "count": str(count)}
     if cursor_ms is not None:
         params[cursor_param] = str(cursor_ms)
+    return await _max_get_json(endpoint, token, params=params)
+
+
+async def _fetch_max_updates(token: str) -> dict[str, Any]:
+    endpoint = "https://platform-api2.max.ru/updates"
+    limit = max(1, min(1000, int(os.getenv("MAX_UPDATES_LIMIT", "1000"))))
+    params = {"limit": str(limit), "timeout": "0"}
     return await _max_get_json(endpoint, token, params=params)
 
 
@@ -776,6 +827,51 @@ def _extract_max_messages_list(payload: Any) -> list[Any]:
     return []
 
 
+def _extract_max_updates_list(payload: Any) -> list[Any]:
+    root = payload if isinstance(payload, dict) else {}
+    candidates = [
+        root.get("updates") if isinstance(root, dict) else None,
+        root.get("items") if isinstance(root, dict) else None,
+        _dict_get(root, "data", "updates"),
+        _dict_get(root, "data", "items"),
+        _dict_get(root, "response", "updates"),
+        _dict_get(root, "response", "items"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return candidate
+    return []
+
+
+def _max_chat_ids_from_updates(payload: Any, items: list[MaxStatsItem]) -> list[str]:
+    updates = _extract_max_updates_list(payload)
+    exact: list[str] = []
+    channel_candidates: list[str] = []
+
+    for update in updates:
+        chat_id = _max_chat_id_from_payload(update)
+        if not chat_id:
+            continue
+
+        if any(_is_max_message_match(update, item.url, str(item.message_id or ""), item.public_text) for item in items):
+            exact.append(chat_id)
+            continue
+
+        if any(item.channel and _payload_contains_string(update, item.channel) for item in items):
+            exact.append(chat_id)
+            continue
+
+        if _max_update_looks_like_channel(update):
+            channel_candidates.append(chat_id)
+
+    exact_ids = _unique(exact)
+    if exact_ids:
+        return exact_ids
+
+    candidate_ids = _unique(channel_candidates)
+    return candidate_ids if len(candidate_ids) == 1 else []
+
+
 def _merge_max_messages(messages: list[Any]) -> list[Any]:
     unique: dict[str, Any] = {}
     for message in messages:
@@ -821,6 +917,56 @@ def _max_message_timestamp_ms(message: Any) -> int | None:
     if timestamp is None:
         return None
     return timestamp * 1000 if timestamp < 10**12 else timestamp
+
+
+def _max_chat_id_from_payload(payload: Any) -> str | None:
+    direct_paths = [
+        "chat_id",
+        "chatId",
+        "chat.chat_id",
+        "chat.chatId",
+        "chat.id",
+        "message.chat_id",
+        "message.chatId",
+        "message.recipient.chat_id",
+        "message.recipient.chatId",
+        "recipient.chat_id",
+        "recipient.chatId",
+    ]
+    for path in direct_paths:
+        value = _value_at_path(payload, path)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    for value in _find_values_by_key(payload, {"chat_id", "chatId"}):
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _max_update_looks_like_channel(payload: Any) -> bool:
+    for value in _find_values_by_key(payload, {"type", "chat_type", "chatType"}):
+        if isinstance(value, str) and "channel" in value.lower():
+            return True
+    return False
+
+
+def _find_values_by_key(value: Any, keys: set[str], depth: int = 0) -> list[Any]:
+    if depth > 6:
+        return []
+    if isinstance(value, dict):
+        found: list[Any] = []
+        for key, child in value.items():
+            if key in keys:
+                found.append(child)
+            found.extend(_find_values_by_key(child, keys, depth + 1))
+        return found
+    if isinstance(value, list):
+        found = []
+        for child in value:
+            found.extend(_find_values_by_key(child, keys, depth + 1))
+        return found
+    return []
 
 
 def _max_message_identity(message: Any) -> str:

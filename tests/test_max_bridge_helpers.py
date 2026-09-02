@@ -9,6 +9,7 @@ from app import (
     _extract_max_messages_list,
     _is_max_message_match,
     _max_chat_id_from_env,
+    _max_chat_ids_from_updates,
     _max_public_text_from_html,
     _max_error_or_hint,
     _max_message_timestamp_ms,
@@ -62,6 +63,29 @@ def test_max_chat_id_from_env(monkeypatch):
     monkeypatch.setenv("MAX_CHANNEL_CHAT_IDS", "Other:111, @NeoficialniyBeZsonoV:-222")
 
     assert _max_chat_id_from_env("neoficialniybezsonov") == "-222"
+
+
+def test_extract_chat_id_from_update_matching_public_text():
+    item = MaxStatsItem(
+        id=1,
+        url="https://max.ru/NeoficialniyBeZsonoV/AZ3OwQ_cBH4",
+        messageId="AZ3OwQ_cBH4",
+        channel="NeoficialniyBeZsonoV",
+        publicText="Алексей, позывной Будулай, доброволец из Оренбургской области. История о простом русском герое.",
+    )
+    payload = {
+        "updates": [
+            {
+                "update_type": "message_created",
+                "message": {
+                    "recipient": {"chat_id": "-333"},
+                    "body": {"text": "Алексей, позывной Будулай, доброволец из Оренбургской области. История о простом русском герое."},
+                },
+            }
+        ]
+    }
+
+    assert _max_chat_ids_from_updates(payload, [item]) == ["-333"]
 
 
 def test_invalid_message_id_becomes_public_link_hint():
