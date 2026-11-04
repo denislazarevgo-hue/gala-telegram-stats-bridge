@@ -66,6 +66,7 @@ def _result(
     status: str,
     error: str | None = None,
     raw_data: Any = None,
+    title: str | None = None,
 ) -> dict[str, Any]:
     if status != "ok":
         views = None
@@ -81,6 +82,7 @@ def _result(
         "source": "telegram_mtproto_bridge",
         "precision": "exact" if status == "ok" else "unknown",
         "raw_data": raw_data,
+        "title": title,
     }
 
 
@@ -274,7 +276,9 @@ async def _collect_channel(client: TelegramClient, channel: str, items: list[Sta
             if views is None and reactions is None:
                 output.append(_result(item, None, None, "not_found", "Telegram не вернул сообщение или статистику."))
             else:
-                output.append(_result(item, views, reactions, "ok", raw_data={"channel": channel, "message_id": item.message_id}))
+                text = str(getattr(message, "message", "") or "")
+                title = next((line.strip() for line in text.splitlines() if line.strip()), "")[:240] or None
+                output.append(_result(item, views, reactions, "ok", raw_data={"channel": channel, "message_id": item.message_id}, title=title))
 
     return output
 
