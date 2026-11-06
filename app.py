@@ -311,13 +311,18 @@ async def _collect_max_batch(items: list[MaxStatsItem], token: str) -> dict[str,
 
     if _max_user_session_configured():
         user_rows = await _collect_max_user_session_batch(candidates)
-        user_ok_keys = {
-            _max_item_key(MaxStatsItem(id=row.get("id"), url=str(row.get("url") or "")))
-            for row in user_rows
+        public_keys = {_max_item_key(item) for item in candidates if item.channel or item.chat_id}
+        accepted_rows = [
+            row for row in user_rows
             if row.get("status") == "ok"
+            or _max_item_key(MaxStatsItem(id=row.get("id"), url=str(row.get("url") or ""))) in public_keys
+        ]
+        output.extend(accepted_rows)
+        accepted_keys = {
+            _max_item_key(MaxStatsItem(id=row.get("id"), url=str(row.get("url") or "")))
+            for row in accepted_rows
         }
-        output.extend(row for row in user_rows if row.get("status") == "ok")
-        candidates = [item for item in candidates if _max_item_key(item) not in user_ok_keys]
+        candidates = [item for item in candidates if _max_item_key(item) not in accepted_keys]
         if not candidates:
             return {"items": sorted(output, key=lambda row: row.get("id") or 0)}
 
@@ -526,67 +531,154 @@ async def _collect_max_user_session_batch(items: list[MaxStatsItem]) -> list[dic
             )
         )
 
-    for raw_group in grouped.values():
-        group = await _hydrate_max_public_texts(raw_group)
-        chat_id = await _resolve_max_user_chat_id(client, group[0])
-        if not chat_id:
-            output.extend(
-                [
-                    _max_result(
-                        item,
-                        None,
-                        None,
-                        "manual_required",
-                        "MAX user-сессия не смогла открыть канал по публичной ссылке.",
-                        source="max_bridge_user_session",
-                    )
-                    for item in group
-                ]
-            )
-            continue
+    semaphore = asyncio.Semaphore(2)
 
-        with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
-        scan = await _scan_max_user_chat(client, chat_id, with_chat_id)
-        if not scan["ok"]:
-            output.extend(
-                [
-                    _max_result(
-                        item,
-                        None,
-                        None,
-                        _status_from_http(int(scan.get("http_status") or 0)),
-                        scan.get("error") or "MAX user-сессия не смогла прочитать историю канала.",
-                        source="max_bridge_user_session",
-                    )
-                    for item in with_chat_id
-                ]
-            )
-            continue
+    async def collect_group(group: list[MaxStatsItem]) -> list[dict[str, Any]]:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(_collect_max_user_group(client, group), timeout=40)
+            except TimeoutError:
+                error = "MAX не ответил вовремя для этого канала. Повторите обновление чуть позже."
+            except Exception as exc:
+                error = f"Не удалось прочитать канал MAX: {_safe_error_text(exc)}"
+            return [
+                _max_result(item, None, None, "manual_required", error, source="max_bridge_user_session")
+                for item in group
+            ]
 
-        messages = scan["messages"]
-        for item in with_chat_id:
-            message = _find_max_message(messages, item.url, str(item.message_id or ""), item.public_text)
-            if message is None and item.message_id and str(item.message_id).isdigit():
-                try:
-                    message = await client.get_message(int(chat_id), int(item.message_id))
-                except Exception:
-                    message = None
-
-            if message is not None:
-                output.append(await _max_result_from_user_message(client, item, chat_id, message))
-            else:
-                output.append(
-                    _max_result(
-                        item,
-                        None,
-                        None,
-                        "manual_required",
-                        _max_user_link_hint(int(scan.get("checked_count") or 0)),
-                        source="max_bridge_user_session",
-                    )
-                )
-
+    for rows in await asyncio.gather(*(collect_group(group) for group in grouped.values())):
+        output.extend(rows)
     return output
+
+
+async def _collect_max_user_group(client: Any, group: list[MaxStatsItem]) -> list[dict[str, Any]]:
+    chat_id = await _resolve_max_user_chat_id(client, group[0])
+    if not chat_id:
+        return [
+            _max_result(item, None, None, "manual_required",
+                        "MAX user-сессия не смогла открыть канал по публичной ссылке.",
+                        source="max_bridge_user_session")
+            for item in group
+        ]
+
+    with_chat_id = [_max_item_with_chat_id(item, chat_id) for item in group]
+    direct = [item for item in with_chat_id if _max_public_message_id(item.message_id) is not None]
+    legacy = [item for item in with_chat_id if _max_public_message_id(item.message_id) is None]
+    output = await _collect_max_user_direct(client, chat_id, direct)
+    if not legacy:
+        return output
+
+    legacy = await _hydrate_max_public_texts(legacy)
+    scan = await _scan_max_user_chat(client, chat_id, legacy)
+    if not scan["ok"]:
+        output.extend([
+            _max_result(item, None, None, _status_from_http(int(scan.get("http_status") or 0)),
+                        scan.get("error") or "MAX user-сессия не смогла прочитать историю канала.",
+                        source="max_bridge_user_session")
+            for item in legacy
+        ])
+        return output
+
+    for item in legacy:
+        message = _find_max_message(scan["messages"], item.url, str(item.message_id or ""), item.public_text)
+        if message is not None:
+            output.append(await _max_result_from_user_message(client, item, chat_id, message))
+        else:
+            output.append(_max_result(
+                item, None, None, "manual_required",
+                _max_user_link_hint(int(scan.get("checked_count") or 0)),
+                source="max_bridge_user_session",
+            ))
+    return output
+
+
+def _max_public_message_id(code: str | None) -> int | None:
+    value = str(code or "").strip()
+    if value.isdigit():
+        number = int(value)
+        return number if 0 < number < 2**63 else None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+        return None
+    raw = base64.urlsafe_b64decode(value + "=")
+    if len(raw) != 8 or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value:
+        return None
+    number = int.from_bytes(raw, "big")
+    return number if 0 < number < 2**63 else None
+
+
+async def _collect_max_user_direct(client: Any, chat_id: str, items: list[MaxStatsItem]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for start in range(0, len(items), 50):
+        chunk = items[start:start + 50]
+        message_ids = list(dict.fromkeys(_max_public_message_id(item.message_id) for item in chunk))
+        messages = await client.get_messages(int(chat_id), message_ids)
+        by_id: dict[int, Any] = {}
+        for message in messages or []:
+            internal_id = _max_message_internal_id(message)
+            returned_chat = _max_chat_id_from_payload(message)
+            if internal_id in message_ids and (returned_chat is None or returned_chat == chat_id):
+                by_id[internal_id] = message
+
+        # Stat/reaction opcodes only read counters; they do not mark posts as viewed.
+        confirmed_ids = list(by_id)
+        views_by_id = await _fetch_max_user_views_batch(client, chat_id, confirmed_ids)
+        reactions_by_id = await _fetch_max_user_reactions_batch(client, chat_id, confirmed_ids)
+        for item in chunk:
+            internal_id = _max_public_message_id(item.message_id)
+            message = by_id.get(internal_id)
+            if message is None:
+                output.append(_max_result(item, None, None, "not_found", "MAX не вернул пост с ID из этой ссылки.", source="max_bridge_user_session"))
+                continue
+            result = _max_result_from_message(item, message, source="max_bridge_user_session")
+            views = views_by_id.get(internal_id, result["views"])
+            reactions = reactions_by_id.get(internal_id, result["reactions"])
+            if views is None and reactions is None:
+                output.append(result)
+                continue
+            output.append(_max_result(
+                item, views, reactions, "ok",
+                raw_data={"message_id": str(internal_id), "chat_id": chat_id, "channel": item.channel},
+                source="max_bridge_user_session", title=result.get("title"),
+            ))
+    return output
+
+
+async def _fetch_max_user_views_batch(client: Any, chat_id: str, message_ids: list[int]) -> dict[int, int]:
+    if not message_ids:
+        return {}
+    try:
+        from pymax.protocol import Opcode
+        response = await client._app.invoke(
+            Opcode.MSG_GET_STAT, {"chatId": int(chat_id), "messageIds": message_ids},
+        )
+        payload = _max_message_payload(getattr(response, "payload", response))
+        stats = payload.get("stats", {}) if isinstance(payload, dict) else {}
+        output: dict[int, int] = {}
+        for message_id in message_ids:
+            value = _first_int(_max_message_payload(stats.get(str(message_id), stats.get(message_id))), ["views", "view_count", "views_count"])
+            if value is not None and value >= 0:
+                output[message_id] = value
+        return output
+    except Exception:
+        return {}
+
+
+async def _fetch_max_user_reactions_batch(client: Any, chat_id: str, message_ids: list[int]) -> dict[int, int]:
+    if not message_ids:
+        return {}
+    try:
+        payload = _max_message_payload(await client.get_reactions(int(chat_id), message_ids))
+        if not isinstance(payload, dict):
+            return {}
+        output: dict[int, int] = {}
+        for message_id in message_ids:
+            info = _max_message_payload(payload.get(str(message_id), payload.get(message_id)))
+            value = _first_int(info, ["total_count", "totalCount", "reaction_info.total_count", "reactionInfo.totalCount", "reactions", "reaction_count"])
+            if value is not None and value >= 0:
+                output[message_id] = value
+        return output
+    except Exception:
+        return {}
 
 
 async def _max_result_from_user_message(
@@ -732,7 +824,12 @@ async def _get_max_user_client() -> Any:
             session_name=session_name,
             extra_config=extra_config,
         )
-        await _max_user_client.connect()
+        try:
+            await asyncio.wait_for(_max_user_client.connect(), timeout=25)
+        except BaseException:
+            await _max_user_client._app.close()
+            _max_user_client = None
+            raise
         return _max_user_client
 
 
@@ -1031,6 +1128,7 @@ def _max_result(
     error: str | None = None,
     raw_data: Any = None,
     source: str = "max_bridge_platform_api",
+    title: str | None = None,
 ) -> dict[str, Any]:
     if status != "ok":
         views = None
@@ -1046,6 +1144,7 @@ def _max_result(
         "source": source,
         "precision": "exact" if status == "ok" else "unknown",
         "raw_data": raw_data,
+        "title": title,
     }
 
 
@@ -1055,6 +1154,8 @@ def _max_result_from_message(
     source: str = "max_bridge_platform_api",
 ) -> dict[str, Any]:
     message = _max_message_payload(message)
+    text = _first_value(message, ["text", "body.text", "description"])
+    title = next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")[:240] or None
     views = _first_int(
         message,
         [
@@ -1095,6 +1196,7 @@ def _max_result_from_message(
             "manual_required",
             "MAX API нашёл сообщение, но не вернул просмотры или реакции. Обычно это значит, что боту не хватает доступа к статистике канала.",
             source=source,
+            title=title,
         )
 
     return _max_result(
@@ -1104,6 +1206,7 @@ def _max_result_from_message(
         "ok",
         raw_data={"message_id": item.message_id, "chat_id": item.chat_id, "channel": item.channel},
         source=source,
+        title=title,
     )
 
 
